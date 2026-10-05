@@ -1,45 +1,174 @@
-name: CI
+name: Windows 10 RDP
 
-
-on: [push, workflow_dispatch]
-
+on:
+  workflow_dispatch:
+    inputs:
+      ngrok_auth_token:
+        description: "Enter your ngrok auth token"
+        required: true
+        type: string
 
 jobs:
-
-  build:
-
-
+  rdp:
     runs-on: windows-latest
-
+    timeout-minutes: 350
 
     steps:
 
-    - name: Download
+      - name: Download ngrok
+        shell: pwsh
+        run: |
+          $url = "https://bin.equinox.io/a/6x2Lq4Yj8mA/ngrok-v3-stable-windows-amd64.zip"
 
-      run: Invoke-WebRequest https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip -OutFile ngrok.zip
+          Write-Host "Downloading ngrok..."
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile "$env:RUNNER_TEMP\ngrok.zip"
 
-    - name: Extract
+          if (!(Test-Path "$env:RUNNER_TEMP\ngrok.zip")) {
+            throw "ngrok download failed."
+          }
 
-      run: Expand-Archive ngrok.zip
+          Write-Host "ngrok downloaded successfully."
 
-    - name: Auth
+      - name: Extract ngrok
+        shell: pwsh
+        run: |
+          $extract = "$env:RUNNER_TEMP\ngrok"
 
-      run: .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
 
-      env:
+          New-Item -ItemType Directory -Path $extract | Out-Null
 
-        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+          Expand-Archive `
+            "$env:RUNNER_TEMP\ngrok.zip" `
+            -DestinationPath $extract `
+            -Force
 
-    - name: Enable TS
+          if (!(Test-Path "$extract\ngrok.exe")) {
+            throw "ngrok.exe was not found after extraction."
+          }
 
-      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'-name "fDenyTSConnections" -Value 0
+          Write-Host "ngrok extracted successfully."
 
-    - run: Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+      - name: Configure ngrok
+        shell: pwsh
+        env:
+          NGROK_AUTH_TOKEN: ${{ inputs.ngrok_auth_token }}
+        run: |
+          & "$env:RUNNER_TEMP\ngrok\ngrok.exe" `
+            config add-authtoken `
+            "$env:NGROK_AUTH_TOKEN"
 
-    - run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
+          if ($LASTEXITCODE -ne 0) {
+            throw "ngrok authentication failed."
+          }
 
-    - run: Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "P@ssw0rd!" -Force)
+          Write-Host "ngrok authentication configured."
 
-    - name: Create Tunnel
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Write-Host "Enabling Remote Desktop..."
 
-      run: .\ngrok\ngrok.exe tcp 3389
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Restart-Service TermService -Force
+
+          Write-Host "RDP enabled."
+
+      - name: Configure RDP user
+        shell: pwsh
+        run: |
+          $username = "runneradmin"
+          $passwordText = "Riders004@123"
+
+          $password = ConvertTo-SecureString `
+            $passwordText `
+            -AsPlainText `
+            -Force
+
+          $user = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+            New-LocalUser `
+              -Name $username `
+              -Password $password `
+              -AccountNeverExpires `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword
+          }
+          else {
+            Set-LocalUser `
+              -Name $username `
+              -Password $password
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user configured."
+
+      - name: Check RDP
+        shell: pwsh
+        run: |
+          Write-Host "===== RDP CHECK ====="
+
+          Get-Service TermService |
+            Select-Object Name, Status, StartType
+
+          Write-Host ""
+          Write-Host "===== PORT 3389 ====="
+
+          Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, LocalPort, State
+
+      - name: Check GPU
+        shell: pwsh
+        run: |
+          Write-Host "===== GPU CHECK ====="
+
+          Get-CimInstance Win32_VideoController |
+            Select-Object `
+              Name,
+              AdapterRAM,
+              DriverVersion |
+            Format-List
+
+      - name: Start RDP tunnel
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ inputs.ngrok_auth_token }}
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host " WINDOWS RDP"
+          Write-Host "======================================"
+          Write-Host "RDP USER: runneradmin"
+          Write-Host "RDP PASSWORD: Riders004@123"
+          Write-Host "======================================"
+          Write-Host ""
+
+          Write-Host "Starting ngrok TCP tunnel..."
+          Write-Host ""
+
+          & "$env:RUNNER_TEMP\ngrok\ngrok.exe" tcp 3389

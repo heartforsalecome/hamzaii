@@ -39,6 +39,10 @@ jobs:
             -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
             -OutFile $zip
 
+          if (-not (Test-Path $zip)) {
+            throw "ngrok download failed."
+          }
+
           Write-Host "Extracting ngrok..."
 
           Expand-Archive `
@@ -49,7 +53,7 @@ jobs:
           $ngrokPath = Join-Path $extract "ngrok.exe"
 
           if (-not (Test-Path $ngrokPath)) {
-            throw "ngrok.exe was not found after extraction."
+            throw "ngrok.exe was not found."
           }
 
           Copy-Item `
@@ -60,6 +64,10 @@ jobs:
           Write-Host ""
           Write-Host "ngrok version:"
           & "C:\Windows\System32\ngrok.exe" version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "ngrok executable failed."
+          }
 
 
       # ============================================================
@@ -76,6 +84,10 @@ jobs:
           Write-Host "CONFIGURING NGROK"
           Write-Host "======================================"
 
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)) {
+            throw "ngrok auth token is empty."
+          }
+
           & "C:\Windows\System32\ngrok.exe" `
             config add-authtoken `
             "$env:NGROK_AUTH_TOKEN"
@@ -88,53 +100,91 @@ jobs:
 
 
       # ============================================================
-      # 3. START NGROK TCP FIRST
+      # 3. START TCP FIRST + CONFIGURE RDP
+      #
+      # IMPORTANT:
+      # ngrok and RDP are handled inside THE SAME STEP.
+      # This prevents GitHub from killing ngrok between steps.
       # ============================================================
-      - name: Start TCP tunnel FIRST
+      - name: Start TCP and configure RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
+          $ngrokExe = "C:\Windows\System32\ngrok.exe"
+          $ngrokStdout = "$env:TEMP\ngrok-stdout.log"
+          $ngrokStderr = "$env:TEMP\ngrok-stderr.log"
+
+          Remove-Item `
+            $ngrokStdout `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Remove-Item `
+            $ngrokStderr `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+
+          # ========================================================
+          # START NGROK FIRST
+          # ========================================================
 
           Write-Host ""
           Write-Host "======================================"
           Write-Host "STARTING TCP TUNNEL FIRST"
           Write-Host "======================================"
           Write-Host ""
-          Write-Host "RDP setup has NOT started yet."
-          Write-Host "Starting ngrok TCP tunnel..."
+          Write-Host "RDP has NOT been configured yet."
+          Write-Host "Starting ngrok TCP tunnel on port 3389..."
           Write-Host ""
 
-          $stdoutFile = "$env:TEMP\ngrok-stdout.log"
-          $stderrFile = "$env:TEMP\ngrok-stderr.log"
-
-          Remove-Item `
-            $stdoutFile `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item `
-            $stderrFile `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          $process = Start-Process `
-            -FilePath "C:\Windows\System32\ngrok.exe" `
-            -ArgumentList "tcp 3389 --log=stdout" `
-            -RedirectStandardOutput $stdoutFile `
-            -RedirectStandardError $stderrFile `
+          $ngrokProcess = Start-Process `
+            -FilePath $ngrokExe `
+            -ArgumentList @(
+              "tcp",
+              "3389",
+              "--log=stdout"
+            ) `
+            -RedirectStandardOutput $ngrokStdout `
+            -RedirectStandardError $ngrokStderr `
             -WindowStyle Hidden `
             -PassThru
 
-          Write-Host "ngrok PID: $($process.Id)"
-
+          Write-Host "ngrok PID: $($ngrokProcess.Id)"
           Write-Host ""
-          Write-Host "Waiting for ngrok TCP endpoint..."
+
+          # ========================================================
+          # WAIT FOR TCP ENDPOINT
+          # ========================================================
 
           $tunnelUrl = $null
 
           for ($i = 1; $i -le 30; $i++) {
 
             Start-Sleep -Seconds 2
+
+            if ($ngrokProcess.HasExited) {
+
+              Write-Host ""
+              Write-Host "======================================"
+              Write-Host "NGROK STOPPED"
+              Write-Host "======================================"
+
+              if (Test-Path $ngrokStdout) {
+                Write-Host ""
+                Write-Host "NGROK STDOUT:"
+                Get-Content $ngrokStdout
+              }
+
+              if (Test-Path $ngrokStderr) {
+                Write-Host ""
+                Write-Host "NGROK STDERR:"
+                Get-Content $ngrokStderr
+              }
+
+              throw "ngrok stopped before creating the TCP tunnel."
+            }
 
             try {
 
@@ -155,83 +205,62 @@ jobs:
 
             }
             catch {
-              # API not ready yet
+              # ngrok API is not ready yet
             }
 
-            if ($process.HasExited) {
-
-              Write-Host ""
-              Write-Host "ngrok process exited unexpectedly."
-
-              if (Test-Path $stdoutFile) {
-                Write-Host ""
-                Write-Host "ngrok stdout:"
-                Get-Content $stdoutFile
-              }
-
-              if (Test-Path $stderrFile) {
-                Write-Host ""
-                Write-Host "ngrok stderr:"
-                Get-Content $stderrFile
-              }
-
-              throw "ngrok TCP process stopped."
-            }
-
-            Write-Host "Waiting... ($i/30)"
+            Write-Host "Waiting for TCP endpoint... ($i/30)"
           }
 
-          if (-not $tunnelUrl) {
+
+          # ========================================================
+          # CHECK TCP ENDPOINT
+          # ========================================================
+
+          if ([string]::IsNullOrWhiteSpace($tunnelUrl)) {
 
             Write-Host ""
             Write-Host "======================================"
-            Write-Host "NGROK FAILED TO PROVIDE TCP ADDRESS"
+            Write-Host "TCP TUNNEL FAILED"
             Write-Host "======================================"
 
-            if (Test-Path $stdoutFile) {
+            if (Test-Path $ngrokStdout) {
               Write-Host ""
-              Write-Host "ngrok stdout:"
-              Get-Content $stdoutFile
+              Write-Host "NGROK STDOUT:"
+              Get-Content $ngrokStdout
             }
 
-            if (Test-Path $stderrFile) {
+            if (Test-Path $ngrokStderr) {
               Write-Host ""
-              Write-Host "ngrok stderr:"
-              Get-Content $stderrFile
+              Write-Host "NGROK STDERR:"
+              Get-Content $ngrokStderr
             }
 
-            throw "TCP tunnel was not created."
+            throw "ngrok did not provide a TCP address."
           }
 
+
+          # ========================================================
+          # TCP ADDRESS AVAILABLE
+          # ========================================================
+
           Write-Host ""
-          Write-Host "======================================"
-          Write-Host "TCP TUNNEL IS READY"
-          Write-Host "======================================"
+          Write-Host "=============================================="
+          Write-Host "          TCP TUNNEL IS READY"
+          Write-Host "=============================================="
           Write-Host ""
           Write-Host "TCP ADDRESS:"
           Write-Host $tunnelUrl
           Write-Host ""
-          Write-Host "RDP setup is starting now."
-          Write-Host "======================================"
-
-          "NGROK_TCP=$tunnelUrl" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Append
-
-          "NGROK_PID=$($process.Id)" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Append
-
-
-      # ============================================================
-      # 4. ENABLE REMOTE DESKTOP
-      # ============================================================
-      - name: Enable Remote Desktop
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
+          Write-Host "ngrok is STILL RUNNING."
           Write-Host ""
+          Write-Host "Now configuring Windows RDP..."
+          Write-Host ""
+
+
+          # ========================================================
+          # ENABLE REMOTE DESKTOP
+          # ========================================================
+
           Write-Host "======================================"
           Write-Host "ENABLING REMOTE DESKTOP"
           Write-Host "======================================"
@@ -257,21 +286,24 @@ jobs:
             -Name "TermService" `
             -Force
 
-          Write-Host "Remote Desktop enabled."
+          Start-Sleep -Seconds 5
+
+          Write-Host "Remote Desktop service configured."
 
 
-      # ============================================================
-      # 5. CONFIGURE RDP USER
-      # ============================================================
-      - name: Configure RDP user
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+          # ========================================================
+          # CREATE RDP USER
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "CONFIGURING RDP USER"
+          Write-Host "======================================"
 
           $username = "runneradmin"
           $passwordText = "Riders004@123"
 
-          $password = ConvertTo-SecureString `
+          $securePassword = ConvertTo-SecureString `
             $passwordText `
             -AsPlainText `
             -Force
@@ -284,21 +316,21 @@ jobs:
 
             New-LocalUser `
               -Name $username `
-              -Password $password `
+              -Password $securePassword `
               -AccountNeverExpires `
               -PasswordNeverExpires `
               -UserMayNotChangePassword
 
-            Write-Host "Created runneradmin."
+            Write-Host "Created user: $username"
 
           }
           else {
 
             Set-LocalUser `
               -Name $username `
-              -Password $password
+              -Password $securePassword
 
-            Write-Host "Updated runneradmin password."
+            Write-Host "Updated password for: $username"
           }
 
           Add-LocalGroupMember `
@@ -309,68 +341,49 @@ jobs:
           Write-Host "RDP user configured."
 
 
-      # ============================================================
-      # 6. VERIFY RDP
-      # ============================================================
-      - name: Verify RDP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+          # ========================================================
+          # VERIFY RDP PORT
+          # ========================================================
 
           Write-Host ""
           Write-Host "======================================"
-          Write-Host "VERIFYING RDP"
+          Write-Host "VERIFYING RDP PORT 3389"
           Write-Host "======================================"
 
-          Start-Sleep -Seconds 5
+          $rdpReady = $false
 
-          Get-Service TermService |
-            Select-Object Name, Status, StartType
-
-          Write-Host ""
-          Write-Host "Checking port 3389..."
-
-          $listener = Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction SilentlyContinue
-
-          if ($listener) {
-
-            Write-Host ""
-            Write-Host "RDP PORT 3389 IS LISTENING."
-
-            $listener |
-              Select-Object LocalAddress, LocalPort, State
-
-          }
-          else {
-
-            Write-Host ""
-            Write-Host "RDP port 3389 is not listening yet."
-            Write-Host "Waiting 10 seconds..."
-
-            Start-Sleep -Seconds 10
+          for ($i = 1; $i -le 15; $i++) {
 
             $listener = Get-NetTCPConnection `
               -LocalPort 3389 `
               -State Listen `
               -ErrorAction SilentlyContinue
 
-            if (-not $listener) {
-              throw "RDP port 3389 is NOT listening."
+            if ($listener) {
+              $rdpReady = $true
+              break
             }
 
-            Write-Host "RDP port 3389 is now listening."
+            Write-Host "Waiting for RDP listener... ($i/15)"
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $rdpReady) {
+
+            Write-Host ""
+            Write-Host "RDP port 3389 is NOT listening."
+
+            Get-Service TermService |
+              Select-Object Name, Status, StartType
+
+            throw "RDP port 3389 failed to start."
           }
 
 
-      # ============================================================
-      # 7. GPU CHECK
-      # ============================================================
-      - name: Check GPU
-        shell: pwsh
-        run: |
+          # ========================================================
+          # GPU CHECK
+          # ========================================================
+
           Write-Host ""
           Write-Host "======================================"
           Write-Host "GPU CHECK"
@@ -384,19 +397,18 @@ jobs:
             Format-List
 
 
-      # ============================================================
-      # 8. FINAL CONNECTION INFORMATION
-      # ============================================================
-      - name: Show RDP connection information
-        shell: pwsh
-        run: |
+          # ========================================================
+          # FINAL CONNECTION INFORMATION
+          # ========================================================
+
           Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "             WINDOWS RDP READY"
-          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host "              WINDOWS RDP READY"
+          Write-Host "=================================================="
           Write-Host ""
           Write-Host "TCP ADDRESS:"
-          Write-Host "$env:NGROK_TCP"
+          Write-Host $tunnelUrl
           Write-Host ""
           Write-Host "USERNAME:"
           Write-Host "runneradmin"
@@ -407,51 +419,58 @@ jobs:
           Write-Host "RDP PORT:"
           Write-Host "3389"
           Write-Host ""
-          Write-Host "=============================================="
+          Write-Host "=================================================="
+          Write-Host "       USE THE TCP ADDRESS IN YOUR RDP APP"
+          Write-Host "=================================================="
           Write-Host ""
 
 
-      # ============================================================
-      # 9. KEEP RDP + NGROK ALIVE
-      # ============================================================
-      - name: Keep RDP alive
-        shell: pwsh
-        run: |
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "RDP SESSION ACTIVE"
-          Write-Host "======================================"
-          Write-Host ""
-          Write-Host "TCP: $env:NGROK_TCP"
-          Write-Host "Username: runneradmin"
-          Write-Host "Password: Riders004@123"
-          Write-Host ""
+          # ========================================================
+          # KEEP EVERYTHING ALIVE
+          #
+          # IMPORTANT:
+          # ngrok remains inside THIS SAME GITHUB STEP.
+          # ========================================================
 
           while ($true) {
 
-            $ngrokProcess = Get-Process `
-              -Id $env:NGROK_PID `
-              -ErrorAction SilentlyContinue
-
-            if (-not $ngrokProcess) {
+            if ($ngrokProcess.HasExited) {
 
               Write-Host ""
-              Write-Host "ERROR: ngrok process has stopped."
-              Write-Host "RDP tunnel is no longer available."
+              Write-Host "======================================"
+              Write-Host "ERROR: NGROK STOPPED"
+              Write-Host "======================================"
+
+              if (Test-Path $ngrokStdout) {
+                Write-Host ""
+                Write-Host "NGROK STDOUT:"
+                Get-Content $ngrokStdout
+              }
+
+              if (Test-Path $ngrokStderr) {
+                Write-Host ""
+                Write-Host "NGROK STDERR:"
+                Get-Content $ngrokStderr
+              }
 
               exit 1
             }
 
-            $rdp = Get-NetTCPConnection `
+            $listener = Get-NetTCPConnection `
               -LocalPort 3389 `
               -State Listen `
               -ErrorAction SilentlyContinue
 
-            if (-not $rdp) {
+            if (-not $listener) {
+
+              Write-Host ""
               Write-Host "WARNING: RDP port 3389 is no longer listening."
+
             }
 
-            Write-Host "$(Get-Date -Format 'HH:mm:ss') - RDP + ngrok active."
+            Write-Host ""
+            Write-Host "$(Get-Date -Format 'HH:mm:ss') - RDP + ngrok ACTIVE"
+            Write-Host "TCP: $tunnelUrl"
 
             Start-Sleep -Seconds 30
           }

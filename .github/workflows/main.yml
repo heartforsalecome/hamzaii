@@ -15,77 +15,87 @@ jobs:
 
     steps:
 
-      - name: Install ngrok
+      - name: Install latest ngrok
         shell: pwsh
         run: |
-          Write-Host "Installing ngrok..."
+          Write-Host "======================================"
+          Write-Host "Installing latest ngrok"
+          Write-Host "======================================"
 
-          winget install ngrok.ngrok `
+          $ErrorActionPreference = "Stop"
+
+          # Remove any old ngrok installation
+          winget uninstall ngrok --silent `
+            --accept-source-agreements `
+            --disable-interactivity `
+            2>$null
+
+          # Install from Microsoft Store source
+          winget install ngrok `
+            --source msstore `
             --silent `
             --accept-source-agreements `
-            --accept-package-agreements
+            --accept-package-agreements `
+            --disable-interactivity
 
-          Write-Host "ngrok installation completed."
-
-      - name: Locate ngrok
-        shell: pwsh
-        run: |
-          $paths = @(
-            "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
-            "$env:ProgramFiles\ngrok",
-            "$env:ChocolateyInstall\bin"
+          # Refresh PATH
+          $env:Path = [System.Environment]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+          ) + ";" + [System.Environment]::GetEnvironmentVariable(
+            "Path",
+            "User"
           )
 
-          $ngrok = Get-Command ngrok.exe -ErrorAction SilentlyContinue
+          $ngrok = Get-Command ngrok.exe `
+            -ErrorAction SilentlyContinue
 
-          if ($ngrok) {
-            Write-Host "ngrok found at:"
-            Write-Host $ngrok.Source
-            exit 0
+          if (-not $ngrok) {
+            throw "ngrok.exe was not found after installation."
           }
 
-          $found = Get-ChildItem `
-            -Path $paths `
-            -Filter "ngrok.exe" `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+          Write-Host ""
+          Write-Host "ngrok location:"
+          Write-Host $ngrok.Source
 
-          if ($found) {
-            Write-Host "ngrok found at:"
-            Write-Host $found.FullName
+          Write-Host ""
+          Write-Host "ngrok version:"
+          & $ngrok.Source version
 
-            "NGROK_DIR=$($found.DirectoryName)" |
-              Out-File `
-                -FilePath $env:GITHUB_ENV `
-                -Append
+      - name: Verify ngrok version
+        shell: pwsh
+        run: |
+          $ngrok = Get-Command ngrok.exe `
+            -ErrorAction Stop
 
-            exit 0
+          Write-Host "Using:"
+          Write-Host $ngrok.Source
+
+          $versionOutput = & $ngrok.Source version
+
+          Write-Host $versionOutput
+
+          if ($versionOutput -match "3\.(\d+)\.") {
+            $minor = [int]$Matches[1]
+
+            if ($minor -lt 20) {
+              throw "ngrok version is too old. Minimum required version is 3.20.0."
+            }
           }
-
-          throw "ngrok.exe could not be found."
 
       - name: Configure ngrok
         shell: pwsh
         env:
           NGROK_AUTH_TOKEN: ${{ inputs.ngrok_auth_token }}
         run: |
-          $ngrok = Get-Command ngrok.exe -ErrorAction SilentlyContinue
+          $ngrok = Get-Command ngrok.exe `
+            -ErrorAction Stop
 
-          if ($ngrok) {
-            $ngrokPath = $ngrok.Source
-          }
-          elseif ($env:NGROK_DIR) {
-            $ngrokPath = Join-Path $env:NGROK_DIR "ngrok.exe"
-          }
-          else {
-            throw "ngrok executable not found."
-          }
+          Write-Host "Configuring ngrok..."
 
-          Write-Host "Using ngrok:"
-          Write-Host $ngrokPath
-
-          & $ngrokPath config add-authtoken "$env:NGROK_AUTH_TOKEN"
+          & $ngrok.Source `
+            config add-authtoken `
+            "$env:NGROK_AUTH_TOKEN"
 
           if ($LASTEXITCODE -ne 0) {
             throw "ngrok authentication failed."
@@ -96,6 +106,8 @@ jobs:
       - name: Enable Remote Desktop
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "Enabling Remote Desktop..."
 
           Set-ItemProperty `
@@ -112,16 +124,16 @@ jobs:
             -DisplayGroup "Remote Desktop"
 
           Set-Service `
-            -Name TermService `
+            -Name "TermService" `
             -StartupType Automatic
 
           Restart-Service `
-            -Name TermService `
+            -Name "TermService" `
             -Force
 
           Write-Host "Remote Desktop enabled."
 
-      - name: Configure RDP User
+      - name: Configure RDP user
         shell: pwsh
         run: |
           $username = "runneradmin"
@@ -132,11 +144,12 @@ jobs:
             -AsPlainText `
             -Force
 
-          $existing = Get-LocalUser `
+          $user = Get-LocalUser `
             -Name $username `
             -ErrorAction SilentlyContinue
 
-          if ($null -eq $existing) {
+          if ($null -eq $user) {
+
             New-LocalUser `
               -Name $username `
               -Password $password `
@@ -144,14 +157,15 @@ jobs:
               -PasswordNeverExpires `
               -UserMayNotChangePassword
 
-            Write-Host "Created RDP user."
-          }
-          else {
+            Write-Host "Created runneradmin."
+
+          } else {
+
             Set-LocalUser `
               -Name $username `
               -Password $password
 
-            Write-Host "Updated RDP user password."
+            Write-Host "Updated runneradmin password."
           }
 
           Add-LocalGroupMember `
@@ -164,30 +178,42 @@ jobs:
       - name: Verify RDP
         shell: pwsh
         run: |
-          Write-Host "===== RDP SERVICE ====="
+          Write-Host "======================================"
+          Write-Host "RDP SERVICE"
+          Write-Host "======================================"
 
           Get-Service TermService |
             Select-Object Name, Status, StartType
 
           Write-Host ""
-          Write-Host "===== PORT 3389 ====="
+          Write-Host "======================================"
+          Write-Host "PORT 3389"
+          Write-Host "======================================"
 
-          $connection = Get-NetTCPConnection `
+          Start-Sleep -Seconds 3
+
+          $listener = Get-NetTCPConnection `
             -LocalPort 3389 `
+            -State Listen `
             -ErrorAction SilentlyContinue
 
-          if ($connection) {
-            $connection |
+          if ($listener) {
+            $listener |
               Select-Object LocalAddress, LocalPort, State
+
+            Write-Host ""
+            Write-Host "RDP port 3389 is listening."
           }
           else {
-            Write-Host "No listener detected yet."
+            throw "RDP port 3389 is NOT listening."
           }
 
       - name: Check GPU
         shell: pwsh
         run: |
-          Write-Host "===== GPU CHECK ====="
+          Write-Host "======================================"
+          Write-Host "GPU CHECK"
+          Write-Host "======================================"
 
           Get-CimInstance Win32_VideoController |
             Select-Object `
@@ -196,34 +222,23 @@ jobs:
               DriverVersion |
             Format-List
 
-      - name: Start ngrok RDP Tunnel
+      - name: Start ngrok TCP tunnel
         shell: pwsh
-        env:
-          NGROK_AUTH_TOKEN: ${{ inputs.ngrok_auth_token }}
         run: |
-          $ngrok = Get-Command ngrok.exe -ErrorAction SilentlyContinue
-
-          if ($ngrok) {
-            $ngrokPath = $ngrok.Source
-          }
-          elseif ($env:NGROK_DIR) {
-            $ngrokPath = Join-Path $env:NGROK_DIR "ngrok.exe"
-          }
-          else {
-            throw "ngrok executable not found."
-          }
+          $ngrok = Get-Command ngrok.exe `
+            -ErrorAction Stop
 
           Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "          WINDOWS RDP READY"
-          Write-Host "=========================================="
+          Write-Host "======================================"
+          Write-Host "WINDOWS RDP READY"
+          Write-Host "======================================"
           Write-Host ""
-          Write-Host "RDP Username: runneradmin"
-          Write-Host "RDP Password: Riders004@123"
+          Write-Host "Username: runneradmin"
+          Write-Host "Password: Riders004@123"
           Write-Host ""
-          Write-Host "Starting ngrok TCP tunnel on port 3389..."
+          Write-Host "Starting ngrok TCP tunnel..."
           Write-Host ""
-          Write-Host "=========================================="
+          Write-Host "======================================"
           Write-Host ""
 
-          & $ngrokPath tcp 3389
+          & $ngrok.Source tcp 3389
